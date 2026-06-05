@@ -1,0 +1,79 @@
+name: Release
+
+# Fires when a tag matching v* is pushed (e.g. `git tag v0.1.0 && git push --tags`).
+# Builds a single-file Linux x86_64 binary with PyInstaller, computes SHA256,
+# and creates a GitHub Release with both artifacts attached.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-linux-x86_64:
+    runs-on: ubuntu-22.04  # glibc 2.35 — binary requires Linux distros with glibc >= 2.35
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Build single-file binary
+        run: |
+          pyinstaller \
+            --onefile \
+            --name pvfd-hlpr-linux-x86_64 \
+            --strip \
+            pvfd_hlpr.py
+
+      - name: Smoke-test the binary
+        run: |
+          ./dist/pvfd-hlpr-linux-x86_64 --version
+          ./dist/pvfd-hlpr-linux-x86_64 --help | head -20
+
+      - name: Compute SHA256 checksum
+        working-directory: dist
+        run: |
+          sha256sum pvfd-hlpr-linux-x86_64 > pvfd-hlpr-linux-x86_64.sha256
+          cat pvfd-hlpr-linux-x86_64.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/pvfd-hlpr-linux-x86_64
+            dist/pvfd-hlpr-linux-x86_64.sha256
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ```sh
+            # Download
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/pvfd-hlpr-linux-x86_64
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/pvfd-hlpr-linux-x86_64.sha256
+
+            # Verify
+            sha256sum -c pvfd-hlpr-linux-x86_64.sha256
+
+            # Run
+            chmod +x pvfd-hlpr-linux-x86_64
+            ./pvfd-hlpr-linux-x86_64
+            ```
+
+            Then click **PULSE** in PioneerVFD.
+
+            Requirements:
+            - PipeWire (`pw-record` from `pipewire-utils` on Arch).
+            - glibc >= 2.35 (Ubuntu 22.04+, Arch rolling, Fedora 36+, etc).
+
+            See the [README](https://github.com/${{ github.repository }}#readme) for usage and `--probe` debugging.
