@@ -91,6 +91,11 @@ except ImportError:  # pragma: no cover
 
 __version__ = "0.1.0"
 PROTOCOL_VERSION = 1
+ALLOWED_ORIGINS = [
+    None,
+    "https://xpui.app.spotify.com",
+    "https://open.spotify.com",
+]
 
 SAMPLE_RATE = 48000
 CHANNELS = 2
@@ -421,9 +426,17 @@ async def main_async(args: argparse.Namespace) -> int:
     async def handler(ws: WebSocketServerProtocol, _path: str = "/") -> None:
         await serve_client(producer, ws)
 
-    logger.info("pvfd-hlpr %s — listening on ws://127.0.0.1:%d (protocol v%d)",
-                __version__, args.port, PROTOCOL_VERSION)
-    async with websockets.serve(handler, "127.0.0.1", args.port, max_size=None):
+    logger.info(
+        "pvfd-hlpr %s — listening on ws://127.0.0.1:%d (protocol v%d)",
+        __version__, args.port, PROTOCOL_VERSION,
+    )
+    async with websockets.serve(
+        handler,
+        "127.0.0.1",
+        args.port,
+        max_size=None,
+        origins=ALLOWED_ORIGINS,
+    ):
         await stop_event.wait()
 
     logger.info("shutting down")

@@ -26,9 +26,9 @@ Leave the terminal running while you use PVFD. Stop with `Ctrl+C`.
 ## Install from source
 
 ```sh
-pipx install pvfd-hlpr
+pipx install git+https://github.com/adainstarks/PVFD-Linux-Helper.git
 # or
-pip install --user pvfd-hlpr
+pip install --user git+https://github.com/adainstarks/PVFD-Linux-Helper.git
 ```
 
 Requirements: Python 3.10+, `pw-record` (from `pipewire-utils` on Arch) or
@@ -62,6 +62,11 @@ default sink's monitor when Spotify isn't playing.
 ## Protocol (v1)
 
 `ws://127.0.0.1:<port>` (default `17455`).
+
+The helper only accepts WebSocket clients with Spotify's web origins
+(`https://xpui.app.spotify.com`, `https://open.spotify.com`) or no Origin
+header, which keeps unrelated browser pages from subscribing to localhost audio
+data.
 
 On connect, helper sends one text frame:
 
