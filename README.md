@@ -63,8 +63,10 @@ combinations expose the active stream only as `media.name="audio-src"`; when
 that stream is the lone active sink-input, HLPR treats it as the Spotify
 candidate. When `parec` is available, HLPR records that exact playback stream
 with `parec --monitor-stream=<id>` so speakers/headphones output routing does
-not change the capture target. Falls back to the sink monitor, then the default
-sink's monitor, when Spotify isn't playing.
+not change the capture target. HLPR asks `parec` for a 20 ms capture latency
+and 10 ms process time so the WebSocket stream updates at PVFD's visualizer
+cadence instead of arriving in large Pulse/PipeWire chunks. Falls back to the
+sink monitor, then the default sink's monitor, when Spotify isn't playing.
 
 ## Protocol (v1)
 
@@ -80,7 +82,7 @@ On connect, helper sends one text frame:
 ```json
 {
   "type": "hello",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "protocol": 1,
   "sampleRate": 48000,
   "fftSize": 2048,

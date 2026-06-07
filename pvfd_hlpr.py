@@ -89,7 +89,7 @@ except ImportError:  # pragma: no cover
     sys.exit(1)
 
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 PROTOCOL_VERSION = 1
 ALLOWED_ORIGINS = [
     None,
@@ -105,6 +105,7 @@ HOP_SAMPLES = SAMPLE_RATE // 30  # ~33 ms per frame, matches PVFD scheduler
 MIN_DB = -100.0
 MAX_DB = -30.0
 DB_RANGE = MAX_DB - MIN_DB
+PAREC_LOW_LATENCY_ARGS = ["--latency-msec=20", "--process-time-msec=10"]
 
 _HANN = np.hanning(FFT_SIZE).astype(np.float32)
 _MAG_NORM = float(FFT_SIZE)
@@ -276,6 +277,7 @@ async def spawn_pw_record(target: Optional[str]) -> asyncio.subprocess.Process:
             "--format", "s16le",
             "--raw",
             f"--monitor-stream={stream_id}",
+            *PAREC_LOW_LATENCY_ARGS,
         ]
     elif target and target.startswith("sink-input:"):
         raise RuntimeError(
@@ -291,6 +293,7 @@ async def spawn_pw_record(target: Optional[str]) -> asyncio.subprocess.Process:
                 "--format", "s16le",
                 "--raw",
                 "-d", target,
+                *PAREC_LOW_LATENCY_ARGS,
             ]
         elif shutil.which("pw-record"):
             cmd = [
@@ -309,6 +312,7 @@ async def spawn_pw_record(target: Optional[str]) -> asyncio.subprocess.Process:
                 "--channels", str(CHANNELS),
                 "--format", "s16le",
                 "--raw",
+                *PAREC_LOW_LATENCY_ARGS,
             ]
             if target:
                 cmd += ["-d", target]
@@ -336,6 +340,9 @@ class FrameProducer:
         self._task: Optional[asyncio.Task[None]] = None
         self._stopping = asyncio.Event()
         self._last_stats_at = 0.0
+        self._last_frame_at = 0.0
+        self._stats_frame_count = 0
+        self._stats_max_gap_ms = 0.0
 
     def subscribe(self) -> asyncio.Queue[bytes]:
         q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=4)
@@ -415,7 +422,15 @@ class FrameProducer:
                 frame = (norm * 255.0).astype(np.uint8)
                 if self.stats:
                     now = time.monotonic()
+                    if self._last_frame_at:
+                        gap_ms = (now - self._last_frame_at) * 1000.0
+                        if gap_ms > self._stats_max_gap_ms:
+                            self._stats_max_gap_ms = gap_ms
+                    self._last_frame_at = now
+                    self._stats_frame_count += 1
                     if now - self._last_stats_at >= 1.0:
+                        elapsed = now - self._last_stats_at if self._last_stats_at else 1.0
+                        fps = self._stats_frame_count / max(0.001, elapsed)
                         self._last_stats_at = now
                         band_means = []
                         for lo_hz, hi_hz in ((28, 70), (70, 160), (160, 420), (420, 1500), (1500, 3200), (3200, 7000), (7000, 12000)):
@@ -423,13 +438,17 @@ class FrameProducer:
                             hi = min(BIN_COUNT - 1, int(np.ceil(hi_hz / (SAMPLE_RATE / FFT_SIZE))))
                             band_means.append(float(np.mean(frame[lo:hi + 1])) if hi >= lo else 0.0)
                         logger.info(
-                            "capture stats: consumers=%d pcm_peak=%.4f pcm_rms=%.4f bin_max=%d bands=%s",
+                            "capture stats: consumers=%d fps=%.1f max_gap_ms=%.1f pcm_peak=%.4f pcm_rms=%.4f bin_max=%d bands=%s",
                             len(self._consumers),
+                            fps,
+                            self._stats_max_gap_ms,
                             pcm_peak,
                             pcm_rms,
                             int(frame.max()) if frame.size else 0,
                             "[" + ", ".join(f"{v:.1f}" for v in band_means) + "]",
                         )
+                        self._stats_frame_count = 0
+                        self._stats_max_gap_ms = 0.0
                 bins = frame.tobytes()
                 if not self._consumers:
                     continue
