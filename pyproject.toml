@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pvfd-hlpr"
-version = "0.1.8"
+version = "0.1.11"
 description = "Linux PipeWire audio bridge for the PioneerVFD Spicetify theme."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,7 @@ classifiers = [
 dependencies = [
     "numpy>=1.24",
     "websockets>=11",
+    "rich>=13",
 ]
 
 [project.scripts]

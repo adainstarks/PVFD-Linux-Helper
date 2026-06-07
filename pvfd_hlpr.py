@@ -89,8 +89,22 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("pvfd-hlpr requires websockets. Install with: pip install websockets numpy\n")
     sys.exit(1)
 
+# rich is preferred for CLI presentation but optional — fall back to plain
+# logging/print so the helper still runs if it's somehow not installed.
+try:
+    from rich.console import Console
+    from rich.logging import RichHandler
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    _RICH = True
+    _console = Console()
+except ImportError:  # pragma: no cover
+    _RICH = False
+    _console = None  # type: ignore[assignment]
 
-__version__ = "0.1.10"
+
+__version__ = "0.1.11"
 PROTOCOL_VERSION = 1
 ALLOWED_ORIGINS = [
     None,
@@ -139,6 +153,68 @@ _VISUAL_EQ_DB_POINTS = np.array(
 _VISUAL_EQ_DB = np.interp(_BIN_FREQS, _VISUAL_EQ_HZ, _VISUAL_EQ_DB_POINTS).astype(np.float32)
 
 logger = logging.getLogger("pvfd-hlpr")
+
+# Pre-rendered figlet "small_slant" art for the startup panel. Kept as a literal
+# so we don't take a runtime dependency on pyfiglet.
+_BANNER_ART = (
+    "   ___ _   _________    __ ________   ___  _______ \n"
+    "  / _ \\ | / / __/ _ \\  / // / __/ /  / _ \\/ __/ _ \\\n"
+    " / ___/ |/ / _// // / / _  / _// /__/ ___/ _// , _/\n"
+    "/_/   |___/_/ /____/ /_//_/___/____/_/  /___/_/|_| "
+)
+
+
+def _configure_logging(verbose: bool = False) -> None:
+    """Set up logging — RichHandler when rich is available, plain otherwise."""
+    level = logging.DEBUG if verbose else logging.INFO
+    root = logging.getLogger()
+    # Wipe any prior handlers so re-entry (tests, reloads) doesn't double-format.
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    if _RICH and _console is not None:
+        handler: logging.Handler = RichHandler(
+            console=_console,
+            rich_tracebacks=True,
+            show_path=False,
+            show_time=True,
+            log_time_format="%H:%M:%S",
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+    else:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(level)
+    logger.setLevel(level)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+
+
+def _render_startup_panel(port: int, target: Optional[str]) -> None:
+    """Print the hero banner + status block. Falls back to plain logger.info."""
+    if not _RICH or _console is None:
+        logger.info(
+            "pvfd-hlpr %s — listening on ws://127.0.0.1:%d (protocol v%d)",
+            __version__, port, PROTOCOL_VERSION,
+        )
+        logger.info("target: %s | profile: %s", target or "(default)", SPECTRUM_PROFILE)
+        return
+    body = Text()
+    body.append(_BANNER_ART, style="bright_magenta")
+    body.append("\n\n")
+    body.append("version  ", style="dim")
+    body.append(f"{__version__}", style="bold")
+    body.append(f"  ·  protocol v{PROTOCOL_VERSION}", style="dim")
+    body.append("\n")
+    body.append("listen   ", style="dim")
+    body.append(f"ws://127.0.0.1:{port}", style="bold cyan")
+    body.append("\n")
+    body.append("target   ", style="dim")
+    body.append(f"{target or '(default monitor)'}", style="bold")
+    body.append("\n")
+    body.append("profile  ", style="dim")
+    body.append(SPECTRUM_PROFILE, style="bold")
+    _console.print(Panel(body, title="[bold bright_magenta]pvfd-hlpr[/]",
+                         border_style="bright_magenta", expand=False, padding=(1, 2)))
 
 
 # ---------- target detection ----------
@@ -613,7 +689,8 @@ async def serve_client(producer: FrameProducer, ws: Any) -> None:
 
 # ---------- probe mode ----------
 
-def cmd_probe() -> int:
+def _probe_plain() -> int:
+    """Fallback probe output when rich isn't available."""
     print(f"pvfd-hlpr {__version__} — probe mode\n")
     pw_record = shutil.which("pw-record")
     parec = shutil.which("parec")
@@ -658,6 +735,92 @@ def cmd_probe() -> int:
         print(f"Default sink's monitor: {default_monitor}")
     auto = auto_detect_target()
     print(f"\nAuto-detected target for capture: {auto or '(none — pw-record will use its default)'}")
+    return 0
+
+
+def cmd_probe() -> int:
+    if not _RICH or _console is None:
+        return _probe_plain()
+
+    _console.print()
+    _render_startup_panel(int(os.environ.get("PVFD_HLPR_PORT", 17455)), None)
+
+    pw_record = shutil.which("pw-record")
+    parec = shutil.which("parec")
+    pactl = shutil.which("pactl")
+
+    def _tool_status(path: Optional[str]) -> Text:
+        if path:
+            return Text(path, style="green")
+        return Text("(not found)", style="red")
+
+    tools = Table(title="Capture tools", title_style="bold bright_magenta",
+                  show_header=True, header_style="bold", border_style="bright_black")
+    tools.add_column("Tool", style="bold")
+    tools.add_column("Path")
+    tools.add_row("pw-record", _tool_status(pw_record))
+    tools.add_row("parec", _tool_status(parec))
+    tools.add_row("pactl", _tool_status(pactl))
+    _console.print(tools)
+
+    if not (pw_record or parec):
+        _console.print("[bold red]FATAL:[/] no capture backend found. Install pipewire-utils (Arch) or pulseaudio-utils.")
+        return 2
+
+    sinks = list_pactl_sinks()
+    sinks_table = Table(title=f"Sinks ({len(sinks)})", title_style="bold bright_magenta",
+                        show_header=True, header_style="bold", border_style="bright_black")
+    sinks_table.add_column("ID", style="dim")
+    sinks_table.add_column("Name", style="bold")
+    sinks_table.add_column("Description")
+    sinks_table.add_column("Monitor", style="cyan")
+    for sink in sinks:
+        sinks_table.add_row(
+            sink["id"],
+            sink["name"],
+            sink.get("description") or "—",
+            sink["monitor"],
+        )
+    _console.print(sinks_table)
+
+    sink_inputs = list_pactl_sink_inputs()
+    inputs_table = Table(title=f"Sink inputs ({len(sink_inputs)})", title_style="bold bright_magenta",
+                         show_header=True, header_style="bold", border_style="bright_black")
+    inputs_table.add_column("ID", style="dim")
+    inputs_table.add_column("Sink", style="dim")
+    inputs_table.add_column("Label", style="bold")
+    inputs_table.add_column("Binary / Node")
+    for item in sink_inputs:
+        label = (
+            item.get("application.name")
+            or item.get("media.name")
+            or item.get("node.name")
+            or "(unnamed)"
+        )
+        binary = item.get("application.process.binary") or item.get("node.name") or "—"
+        is_spotify = "spotify" in (binary + " " + label).lower()
+        label_text = Text(label, style="bright_green" if is_spotify else "bold")
+        inputs_table.add_row(item["id"], f"#{item['sink']}", label_text, binary)
+    _console.print(inputs_table)
+
+    spotify_sink_id = find_spotify_sink_id()
+    default_monitor = find_default_monitor()
+    auto = auto_detect_target()
+
+    summary = Text()
+    summary.append("Spotify routing  ", style="dim")
+    if spotify_sink_id is not None:
+        summary.append(f"sink #{spotify_sink_id}", style="bold bright_green")
+    else:
+        summary.append("(not playing)", style="yellow")
+    summary.append("\n")
+    summary.append("Default monitor  ", style="dim")
+    summary.append(default_monitor or "(unknown)", style="bold")
+    summary.append("\n")
+    summary.append("Auto target      ", style="dim")
+    summary.append(auto or "(pw-record default)", style="bold cyan")
+    _console.print(Panel(summary, title="[bold bright_magenta]Summary[/]",
+                         border_style="bright_magenta", expand=False, padding=(1, 2)))
     return 0
 
 
@@ -839,12 +1002,7 @@ async def _watch_spotify(stop_event: asyncio.Event) -> None:
 # ---------- main ----------
 
 async def main_async(args: argparse.Namespace) -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
-    logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
-    logging.getLogger("websockets").setLevel(logging.WARNING)
+    _configure_logging(verbose=args.verbose)
 
     target = args.target
     if not target:
@@ -882,10 +1040,7 @@ async def main_async(args: argparse.Namespace) -> int:
     async def handler(ws: Any, _path: str = "/") -> None:
         await serve_client(producer, ws)
 
-    logger.info(
-        "pvfd-hlpr %s — listening on ws://127.0.0.1:%d (protocol v%d)",
-        __version__, args.port, PROTOCOL_VERSION,
-    )
+    _render_startup_panel(args.port, target)
     server = await websockets.serve(
         handler,
         "127.0.0.1",
