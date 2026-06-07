@@ -74,6 +74,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 try:
@@ -353,11 +354,13 @@ class FrameProducer:
         stats: bool = False,
         legacy_eq: bool = False,
         smoothing: float = SMOOTHING_TIME_CONSTANT,
+        target_explicit: bool = False,
     ):
         self.target = target
         self.stats = stats
         self.legacy_eq = legacy_eq
         self.smoothing = max(0.0, min(0.99, float(smoothing)))
+        self.target_explicit = target_explicit
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._consumers: list[asyncio.Queue[bytes]] = []
         self._task: Optional[asyncio.Task[None]] = None
@@ -380,8 +383,60 @@ class FrameProducer:
     async def start(self) -> None:
         if self._task is not None:
             return
+        # Eager first spawn so callers see RuntimeError immediately if backend missing.
         self._proc = await spawn_pw_record(self.target)
-        self._task = asyncio.create_task(self._run())
+        self._task = asyncio.create_task(self._supervisor())
+
+    async def _supervisor(self) -> None:
+        """Outer loop: runs _run, restarts on natural EOF or target change."""
+        backoff_s = 0.5
+        try:
+            while not self._stopping.is_set():
+                if self._proc is None:
+                    try:
+                        self._proc = await spawn_pw_record(self.target)
+                    except RuntimeError as exc:
+                        logger.error("respawn failed: %s", exc)
+                        try:
+                            await asyncio.wait_for(self._stopping.wait(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
+                try:
+                    await self._run()
+                finally:
+                    if self._proc and self._proc.returncode is None:
+                        try:
+                            self._proc.terminate()
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            await asyncio.wait_for(self._proc.wait(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            try:
+                                self._proc.kill()
+                            except ProcessLookupError:
+                                pass
+                    self._proc = None
+                if self._stopping.is_set():
+                    break
+                # Try re-detecting target before next spawn.
+                if not self.target_explicit:
+                    new_target = auto_detect_target()
+                    if new_target and new_target != self.target:
+                        logger.info("target changed: %s → %s", self.target, new_target)
+                        self.target = new_target
+                        backoff_s = 0.5
+                        continue
+                try:
+                    await asyncio.wait_for(self._stopping.wait(), timeout=backoff_s)
+                except asyncio.TimeoutError:
+                    pass
+                backoff_s = min(backoff_s * 2.0, 5.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("supervisor crashed")
 
     async def stop(self) -> None:
         self._stopping.set()
@@ -432,8 +487,19 @@ class FrameProducer:
         bytes_per_frame = FFT_SIZE * CHANNELS * 2
         hop_bytes = HOP_SAMPLES * CHANNELS * 2
         ring = bytearray()
+        last_target_check = time.monotonic()
         try:
             while not self._stopping.is_set():
+                # Periodic target re-detection — handles "Spotify launched after helper" and "user switched output device".
+                if not self.target_explicit:
+                    now = time.monotonic()
+                    if now - last_target_check >= 10.0:
+                        last_target_check = now
+                        new_target = auto_detect_target()
+                        if new_target and new_target != self.target:
+                            logger.info("target changed: %s → %s", self.target, new_target)
+                            self.target = new_target
+                            return  # supervisor respawns with new target
                 chunk = await self._read_chunk(hop_bytes)
                 if chunk is None:
                     err = ""
@@ -443,7 +509,7 @@ class FrameProducer:
                         except Exception:
                             pass
                     logger.warning("capture stream ended (stderr: %s)", err.strip() or "<empty>")
-                    break
+                    return
                 ring.extend(chunk)
                 if len(ring) < bytes_per_frame:
                     continue
@@ -595,6 +661,181 @@ def cmd_probe() -> int:
     return 0
 
 
+# ---------- spotify launcher hook ----------
+
+PVFD_HLPR_DESKTOP_MARKER = "# pvfd-hlpr-wrapped"
+
+
+def _spotify_desktop_candidates() -> list[Path]:
+    home = Path.home()
+    return [
+        Path("/usr/share/applications/spotify.desktop"),
+        Path("/usr/local/share/applications/spotify.desktop"),
+        Path("/var/lib/flatpak/exports/share/applications/com.spotify.Client.desktop"),
+        home / ".local/share/flatpak/exports/share/applications/com.spotify.Client.desktop",
+        Path("/var/lib/snapd/desktop/applications/spotify_spotify.desktop"),
+        home / ".local/share/applications/spotify.desktop",
+    ]
+
+
+def _find_spotify_desktop_source() -> Optional[Path]:
+    user_dir = Path.home() / ".local/share/applications"
+    user_override = user_dir / "spotify.desktop"
+    for cand in _spotify_desktop_candidates():
+        if cand == user_override:
+            continue
+        if cand.exists():
+            return cand
+    if user_override.exists():
+        return user_override
+    return None
+
+
+def _wrap_exec_line(line: str, hlpr_path: str) -> str:
+    prefix, sep, value = line.partition("=")
+    if sep != "=" or not value.strip():
+        return line
+    # Escape single quotes for the sh -c wrapper.
+    safe_hlpr = hlpr_path.replace("'", "'\\''")
+    safe_original = value.strip().replace("'", "'\\''")
+    wrapped = (
+        f"sh -c 'pgrep -x pvfd-hlpr >/dev/null || "
+        f"{safe_hlpr} --exit-with-spotify >/dev/null 2>&1 & "
+        f"exec {safe_original}'"
+    )
+    return f"{prefix}={wrapped}"
+
+
+def cmd_link_to_spotify() -> int:
+    source = _find_spotify_desktop_source()
+    if source is None:
+        print("Couldn't find Spotify's launcher entry. Is Spotify installed?")
+        return 2
+
+    hlpr_path = shutil.which("pvfd-hlpr") or "pvfd-hlpr"
+
+    try:
+        content = source.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"Could not read {source}: {exc}")
+        return 2
+
+    new_lines: list[str] = []
+    changed = False
+    for line in content.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        suffix = line[len(stripped):]
+        if stripped.startswith("Exec=") and "pvfd-hlpr" not in stripped:
+            new_lines.append(_wrap_exec_line(stripped, hlpr_path) + suffix)
+            changed = True
+        else:
+            new_lines.append(line)
+    if not changed:
+        print(f"No Exec= lines to wrap in {source}.")
+        return 2
+
+    new_content = "".join(new_lines)
+    if not new_content.endswith("\n"):
+        new_content += "\n"
+    new_content += f"{PVFD_HLPR_DESKTOP_MARKER}\n"
+
+    user_dir = Path.home() / ".local/share/applications"
+    dest = user_dir / source.name
+    try:
+        user_dir.mkdir(parents=True, exist_ok=True)
+        if dest.exists() and dest.read_text(encoding="utf-8") == new_content:
+            print(f"✓ Spotify launcher link already up to date ({dest}).")
+            return 0
+        dest.write_text(new_content, encoding="utf-8")
+    except OSError as exc:
+        print(f"Could not write {dest}: {exc}")
+        return 2
+
+    if shutil.which("update-desktop-database"):
+        try:
+            subprocess.run(
+                ["update-desktop-database", str(user_dir)],
+                check=False, capture_output=True, timeout=4,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    print("✓ Linked pvfd-hlpr to Spotify launches.")
+    print(f"  Override:   {dest}")
+    print(f"  Source:     {source}")
+    print("  From now on, launching Spotify (KDE menu, dock, `spotify` in terminal) starts pvfd-hlpr too.")
+    print("  To undo:    pvfd-hlpr --unlink-spotify")
+    return 0
+
+
+def cmd_unlink_spotify() -> int:
+    user_dir = Path.home() / ".local/share/applications"
+    candidates = [
+        user_dir / "spotify.desktop",
+        user_dir / "com.spotify.Client.desktop",
+        user_dir / "spotify_spotify.desktop",
+    ]
+    removed: list[Path] = []
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        if PVFD_HLPR_DESKTOP_MARKER not in text and "--exit-with-spotify" not in text:
+            # Not ours — don't touch a hand-edited override.
+            continue
+        try:
+            path.unlink()
+            removed.append(path)
+        except OSError as exc:
+            print(f"Could not remove {path}: {exc}")
+
+    if shutil.which("update-desktop-database"):
+        try:
+            subprocess.run(
+                ["update-desktop-database", str(user_dir)],
+                check=False, capture_output=True, timeout=4,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    if removed:
+        print("✓ Unlinked. Removed:")
+        for p in removed:
+            print(f"  {p}")
+    else:
+        print("No pvfd-hlpr → Spotify link found (nothing to remove).")
+    return 0
+
+
+async def _watch_spotify(stop_event: asyncio.Event) -> None:
+    """Poll for the Spotify process every 2s. When it vanishes, set stop_event."""
+    if not shutil.which("pgrep"):
+        logger.warning("--exit-with-spotify: pgrep not available, watcher disabled")
+        return
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pgrep", "-x", "spotify",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            rc = await proc.wait()
+        except (OSError, asyncio.CancelledError):
+            return
+        if rc != 0:
+            logger.info("Spotify exited — shutting down helper")
+            stop_event.set()
+            return
+
+
 # ---------- main ----------
 
 async def main_async(args: argparse.Namespace) -> int:
@@ -618,6 +859,7 @@ async def main_async(args: argparse.Namespace) -> int:
         stats=args.stats,
         legacy_eq=args.legacy_eq,
         smoothing=args.smoothing,
+        target_explicit=bool(args.target),
     )
     try:
         await producer.start()
@@ -632,6 +874,10 @@ async def main_async(args: argparse.Namespace) -> int:
             loop.add_signal_handler(getattr(signal, sig_name), stop_event.set)
         except (NotImplementedError, AttributeError):
             pass
+
+    spotify_watcher_task: Optional[asyncio.Task[None]] = None
+    if getattr(args, "exit_with_spotify", False):
+        spotify_watcher_task = asyncio.create_task(_watch_spotify(stop_event))
 
     async def handler(ws: Any, _path: str = "/") -> None:
         await serve_client(producer, ws)
@@ -653,6 +899,12 @@ async def main_async(args: argparse.Namespace) -> int:
         logger.info("shutting down")
         server.close()
         await producer.stop()
+        if spotify_watcher_task is not None:
+            spotify_watcher_task.cancel()
+            try:
+                await spotify_watcher_task
+            except (asyncio.CancelledError, Exception):
+                pass
         try:
             await asyncio.wait_for(server.wait_closed(), timeout=2.0)
         except asyncio.TimeoutError:
@@ -677,8 +929,18 @@ def main() -> int:
                         help="Apply the 0.1.8 fixed EQ tilt before dB mapping (A/B against flat bytes).")
     parser.add_argument("--smoothing", type=float, default=SMOOTHING_TIME_CONSTANT,
                         help="Magnitude smoothing constant (0.0=raw, 0.32=PVFD AnalyserNode default, 0.8=Web Audio spec default).")
+    parser.add_argument("--with-spotify", dest="with_spotify", action="store_true",
+                        help="One-shot setup: wrap Spotify's launcher so every Spotify launch also fires pvfd-hlpr, then exit.")
+    parser.add_argument("--unlink-spotify", dest="unlink_spotify", action="store_true",
+                        help="Remove the Spotify launcher link installed by --with-spotify.")
+    parser.add_argument("--exit-with-spotify", dest="exit_with_spotify", action="store_true",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--version", action="version", version=f"pvfd-hlpr {__version__} (protocol v{PROTOCOL_VERSION})")
     args = parser.parse_args()
+    if args.with_spotify:
+        return cmd_link_to_spotify()
+    if args.unlink_spotify:
+        return cmd_unlink_spotify()
     if args.probe:
         return cmd_probe()
     try:
