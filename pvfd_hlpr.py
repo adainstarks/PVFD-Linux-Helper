@@ -89,7 +89,7 @@ except ImportError:  # pragma: no cover
     sys.exit(1)
 
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 PROTOCOL_VERSION = 1
 ALLOWED_ORIGINS = [
     None,
@@ -197,9 +197,8 @@ def list_pactl_sink_inputs() -> list[dict[str, str]]:
     return inputs
 
 
-def find_spotify_sink_id() -> Optional[str]:
-    """Walk sink-inputs and return the Sink ID Spotify is currently playing
-    into, or None if Spotify isn't playing right now."""
+def find_spotify_sink_input() -> Optional[dict[str, str]]:
+    """Return the active Spotify-like sink input, if one can be identified."""
     inputs = list_pactl_sink_inputs()
     for item in inputs:
         haystack = " ".join([
@@ -211,7 +210,7 @@ def find_spotify_sink_id() -> Optional[str]:
             item.get("node.description", ""),
         ]).lower()
         if "spotify" in haystack:
-            return item["sink"]
+            return item
     audio_src_inputs = [
         item for item in inputs
         if item.get("media.name", "").strip().lower() == "audio-src"
@@ -221,15 +220,21 @@ def find_spotify_sink_id() -> Optional[str]:
             "using lone audio-src sink-input #%s as Spotify candidate",
             audio_src_inputs[0]["id"],
         )
-        return audio_src_inputs[0]["sink"]
+        return audio_src_inputs[0]
     if len(inputs) == 1:
         logger.info(
             "using only active sink-input #%s (%s) as Spotify candidate",
             inputs[0]["id"],
             inputs[0].get("media.name") or "unnamed",
         )
-        return inputs[0]["sink"]
+        return inputs[0]
     return None
+
+
+def find_spotify_sink_id() -> Optional[str]:
+    """Return the Sink ID Spotify is currently playing into."""
+    item = find_spotify_sink_input()
+    return item["sink"] if item else None
 
 
 def find_default_monitor() -> Optional[str]:
@@ -247,7 +252,10 @@ def find_default_monitor() -> Optional[str]:
 
 def auto_detect_target() -> Optional[str]:
     """Return the best guess for which monitor source to record from."""
-    spotify_sink_id = find_spotify_sink_id()
+    spotify_input = find_spotify_sink_input()
+    if spotify_input and shutil.which("parec"):
+        return f"sink-input:{spotify_input['id']}"
+    spotify_sink_id = spotify_input["sink"] if spotify_input else None
     sinks = list_pactl_sinks()
     if spotify_sink_id is not None:
         for sink in sinks:
@@ -259,41 +267,56 @@ def auto_detect_target() -> Optional[str]:
 # ---------- capture subprocess ----------
 
 async def spawn_pw_record(target: Optional[str]) -> asyncio.subprocess.Process:
-    use_parec_monitor = bool(target and target.endswith(".monitor") and shutil.which("parec"))
-    if use_parec_monitor:
+    if target and target.startswith("sink-input:") and shutil.which("parec"):
+        stream_id = target.split(":", 1)[1]
         cmd = [
             "parec",
             "--rate", str(SAMPLE_RATE),
             "--channels", str(CHANNELS),
             "--format", "s16le",
             "--raw",
-            "-d", target,
+            f"--monitor-stream={stream_id}",
         ]
-    elif shutil.which("pw-record"):
-        cmd = [
-            "pw-record",
-            "--rate", str(SAMPLE_RATE),
-            "--channels", str(CHANNELS),
-            "--format", "s16",
-        ]
-        if target:
-            cmd += ["--target", target]
-        cmd += ["-"]
-    elif shutil.which("parec"):
-        cmd = [
-            "parec",
-            "--rate", str(SAMPLE_RATE),
-            "--channels", str(CHANNELS),
-            "--format", "s16le",
-            "--raw",
-        ]
-        if target:
-            cmd += ["-d", target]
-    else:
+    elif target and target.startswith("sink-input:"):
         raise RuntimeError(
-            "neither pw-record nor parec found on PATH — install pipewire-utils "
-            "(Arch) or pulseaudio-utils"
+            "sink-input capture requires parec — install libpulse on Arch"
         )
+    else:
+        use_parec_monitor = bool(target and target.endswith(".monitor") and shutil.which("parec"))
+        if use_parec_monitor:
+            cmd = [
+                "parec",
+                "--rate", str(SAMPLE_RATE),
+                "--channels", str(CHANNELS),
+                "--format", "s16le",
+                "--raw",
+                "-d", target,
+            ]
+        elif shutil.which("pw-record"):
+            cmd = [
+                "pw-record",
+                "--rate", str(SAMPLE_RATE),
+                "--channels", str(CHANNELS),
+                "--format", "s16",
+            ]
+            if target:
+                cmd += ["--target", target]
+            cmd += ["-"]
+        elif shutil.which("parec"):
+            cmd = [
+                "parec",
+                "--rate", str(SAMPLE_RATE),
+                "--channels", str(CHANNELS),
+                "--format", "s16le",
+                "--raw",
+            ]
+            if target:
+                cmd += ["-d", target]
+        else:
+            raise RuntimeError(
+                "neither pw-record nor parec found on PATH — install pipewire-utils "
+                "(Arch) or pulseaudio-utils"
+            )
     logger.info("starting capture: %s", " ".join(cmd))
     return await asyncio.create_subprocess_exec(
         *cmd,

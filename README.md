@@ -50,6 +50,7 @@ routed somewhere, and prints the auto-detected target. No WebSocket binds.
 ```
 pvfd-hlpr --port 17455               # bind a different port
 pvfd-hlpr --target <sink>.monitor    # pick a specific PipeWire monitor source
+pvfd-hlpr --target sink-input:<id>   # record one playback stream by sink-input ID
 pvfd-hlpr --verbose                  # debug logging
 pvfd-hlpr --stats                    # one capture stats line per second
 pvfd-hlpr --probe                    # one-shot diagnostic, no WS bind
@@ -60,9 +61,10 @@ Auto-detection finds the sink Spotify is currently routed to (via
 `pactl list sink-inputs`) and uses its `.monitor` source. Some Spotify/Linux
 combinations expose the active stream only as `media.name="audio-src"`; when
 that stream is the lone active sink-input, HLPR treats it as the Spotify
-candidate. Falls back to the default sink's monitor when Spotify isn't
-playing. For Pulse/PipeWire monitor names (`*.monitor`), HLPR records through
-`parec -d <monitor>` so the selected monitor source is captured directly.
+candidate. When `parec` is available, HLPR records that exact playback stream
+with `parec --monitor-stream=<id>` so speakers/headphones output routing does
+not change the capture target. Falls back to the sink monitor, then the default
+sink's monitor, when Spotify isn't playing.
 
 ## Protocol (v1)
 
@@ -78,7 +80,7 @@ On connect, helper sends one text frame:
 ```json
 {
   "type": "hello",
-  "version": "0.1.1",
+  "version": "0.1.6",
   "protocol": 1,
   "sampleRate": 48000,
   "fftSize": 2048,
