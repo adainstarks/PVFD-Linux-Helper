@@ -57,8 +57,11 @@ pvfd-hlpr --version
 ```
 
 Auto-detection finds the sink Spotify is currently routed to (via
-`pactl list sink-inputs`) and uses its `.monitor` source. Falls back to the
-default sink's monitor when Spotify isn't playing.
+`pactl list sink-inputs`) and uses its `.monitor` source. Some Spotify/Linux
+combinations expose the active stream only as `media.name="audio-src"`; when
+that stream is the lone active sink-input, HLPR treats it as the Spotify
+candidate. Falls back to the default sink's monitor when Spotify isn't
+playing.
 
 ## Protocol (v1)
 

@@ -89,7 +89,7 @@ except ImportError:  # pragma: no cover
     sys.exit(1)
 
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 PROTOCOL_VERSION = 1
 ALLOWED_ORIGINS = [
     None,
@@ -161,11 +161,10 @@ def list_pactl_sinks() -> list[dict[str, str]]:
     return sinks
 
 
-def find_spotify_sink_id() -> Optional[str]:
-    """Walk sink-inputs and return the Sink ID Spotify is currently playing
-    into, or None if Spotify isn't playing right now."""
+def list_pactl_sink_inputs() -> list[dict[str, str]]:
+    """Return active playback streams visible via pactl."""
     if not shutil.which("pactl"):
-        return None
+        return []
     try:
         out = subprocess.run(
             ["pactl", "list", "sink-inputs"],
@@ -173,12 +172,63 @@ def find_spotify_sink_id() -> Optional[str]:
         ).stdout
     except (subprocess.SubprocessError, OSError) as exc:
         logger.debug("pactl list sink-inputs failed: %s", exc)
-        return None
-    for block in out.split("Sink Input #"):
-        if "application.name" in block and "Spotify" in block:
-            m = re.search(r"^\s*Sink:\s*(\d+)", block, re.MULTILINE)
-            if m:
-                return m.group(1)
+        return []
+    inputs = []
+    for block in out.split("Sink Input #")[1:]:
+        m_id = re.match(r"\s*(\d+)", block)
+        m_sink = re.search(r"^\s*Sink:\s*(\d+)", block, re.MULTILINE)
+        if not (m_id and m_sink):
+            continue
+        props = {
+            "id": m_id.group(1),
+            "sink": m_sink.group(1),
+            "media.name": "",
+            "application.name": "",
+            "application.process.binary": "",
+            "application.process.command_line": "",
+            "node.name": "",
+            "node.description": "",
+        }
+        for key in list(props.keys())[2:]:
+            match = re.search(r'^\s*' + re.escape(key) + r'\s*=\s*"?(.*?)"?\s*$', block, re.MULTILINE)
+            if match:
+                props[key] = match.group(1).strip()
+        inputs.append(props)
+    return inputs
+
+
+def find_spotify_sink_id() -> Optional[str]:
+    """Walk sink-inputs and return the Sink ID Spotify is currently playing
+    into, or None if Spotify isn't playing right now."""
+    inputs = list_pactl_sink_inputs()
+    for item in inputs:
+        haystack = " ".join([
+            item.get("media.name", ""),
+            item.get("application.name", ""),
+            item.get("application.process.binary", ""),
+            item.get("application.process.command_line", ""),
+            item.get("node.name", ""),
+            item.get("node.description", ""),
+        ]).lower()
+        if "spotify" in haystack:
+            return item["sink"]
+    audio_src_inputs = [
+        item for item in inputs
+        if item.get("media.name", "").strip().lower() == "audio-src"
+    ]
+    if len(audio_src_inputs) == 1:
+        logger.info(
+            "using lone audio-src sink-input #%s as Spotify candidate",
+            audio_src_inputs[0]["id"],
+        )
+        return audio_src_inputs[0]["sink"]
+    if len(inputs) == 1:
+        logger.info(
+            "using only active sink-input #%s (%s) as Spotify candidate",
+            inputs[0]["id"],
+            inputs[0].get("media.name") or "unnamed",
+        )
+        return inputs[0]["sink"]
     return None
 
 
@@ -419,6 +469,20 @@ def cmd_probe() -> int:
         if sink["description"]:
             print(f"        description: {sink['description']}")
         print(f"        monitor:     {sink['monitor']}")
+    sink_inputs = list_pactl_sink_inputs()
+    print(f"\nSink inputs ({len(sink_inputs)}):")
+    for item in sink_inputs:
+        label = (
+            item.get("application.name")
+            or item.get("media.name")
+            or item.get("node.name")
+            or "(unnamed)"
+        )
+        print(f"  [{item['id']}] sink #{item['sink']}  {label}")
+        for key in ("media.name", "application.name", "application.process.binary", "node.name", "node.description"):
+            value = item.get(key)
+            if value:
+                print(f"        {key}: {value}")
     spotify_sink_id = find_spotify_sink_id()
     print()
     if spotify_sink_id is not None:
