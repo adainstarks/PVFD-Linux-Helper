@@ -104,7 +104,7 @@ except ImportError:  # pragma: no cover
     _console = None  # type: ignore[assignment]
 
 
-__version__ = "0.1.11"
+__version__ = "0.1.12"
 PROTOCOL_VERSION = 1
 ALLOWED_ORIGINS = [
     None,
@@ -832,25 +832,37 @@ PVFD_HLPR_DESKTOP_MARKER = "# pvfd-hlpr-wrapped"
 def _spotify_desktop_candidates() -> list[Path]:
     home = Path.home()
     return [
+        # AUR `spotify` and most native installs
         Path("/usr/share/applications/spotify.desktop"),
         Path("/usr/local/share/applications/spotify.desktop"),
+        # `spotify-launcher` (Arch official `extra` repo)
+        Path("/usr/share/applications/spotify-launcher.desktop"),
+        Path("/usr/local/share/applications/spotify-launcher.desktop"),
+        # Flatpak
         Path("/var/lib/flatpak/exports/share/applications/com.spotify.Client.desktop"),
         home / ".local/share/flatpak/exports/share/applications/com.spotify.Client.desktop",
+        # Snap
         Path("/var/lib/snapd/desktop/applications/spotify_spotify.desktop"),
+        # User overrides (last so we prefer pristine system sources for the unwrapped Exec)
         home / ".local/share/applications/spotify.desktop",
+        home / ".local/share/applications/spotify-launcher.desktop",
     ]
 
 
 def _find_spotify_desktop_source() -> Optional[Path]:
     user_dir = Path.home() / ".local/share/applications"
-    user_override = user_dir / "spotify.desktop"
+    user_overrides = {
+        user_dir / "spotify.desktop",
+        user_dir / "spotify-launcher.desktop",
+    }
     for cand in _spotify_desktop_candidates():
-        if cand == user_override:
+        if cand in user_overrides:
             continue
         if cand.exists():
             return cand
-    if user_override.exists():
-        return user_override
+    for cand in user_overrides:
+        if cand.exists():
+            return cand
     return None
 
 
@@ -935,6 +947,7 @@ def cmd_unlink_spotify() -> int:
     user_dir = Path.home() / ".local/share/applications"
     candidates = [
         user_dir / "spotify.desktop",
+        user_dir / "spotify-launcher.desktop",
         user_dir / "com.spotify.Client.desktop",
         user_dir / "spotify_spotify.desktop",
     ]
@@ -974,29 +987,45 @@ def cmd_unlink_spotify() -> int:
 
 
 async def _watch_spotify(stop_event: asyncio.Event) -> None:
-    """Poll for the Spotify process every 2s. When it vanishes, set stop_event."""
+    """Poll for Spotify-related processes every 2s. When all are gone, set stop_event.
+
+    Tracks both `spotify` (the real client) and `spotify-launcher` (the Arch
+    `extra` wrapper that fetches+execs the real client). A 30s grace period
+    lets spotify-launcher bootstrap before we'd ever decide Spotify is gone.
+    """
     if not shutil.which("pgrep"):
         logger.warning("--exit-with-spotify: pgrep not available, watcher disabled")
         return
+    grace_until = time.monotonic() + 30.0
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=2.0)
             return
         except asyncio.TimeoutError:
             pass
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "pgrep", "-x", "spotify",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            rc = await proc.wait()
-        except (OSError, asyncio.CancelledError):
-            return
-        if rc != 0:
-            logger.info("Spotify exited — shutting down helper")
-            stop_event.set()
-            return
+        alive = False
+        for name in ("spotify", "spotify-launcher"):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "pgrep", "-x", name,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                rc = await proc.wait()
+            except (OSError, asyncio.CancelledError):
+                return
+            if rc == 0:
+                alive = True
+                break
+        if alive:
+            # Reset grace; once we've seen Spotify alive, future absences mean it exited.
+            grace_until = 0.0
+            continue
+        if time.monotonic() < grace_until:
+            continue
+        logger.info("Spotify exited — shutting down helper")
+        stop_event.set()
+        return
 
 
 # ---------- main ----------
