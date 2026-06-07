@@ -89,7 +89,7 @@ except ImportError:  # pragma: no cover
     sys.exit(1)
 
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 PROTOCOL_VERSION = 1
 ALLOWED_ORIGINS = [
     None,
@@ -108,6 +108,22 @@ DB_RANGE = MAX_DB - MIN_DB
 
 _HANN = np.hanning(FFT_SIZE).astype(np.float32)
 _MAG_NORM = float(FFT_SIZE)
+_BIN_FREQS = (np.arange(BIN_COUNT, dtype=np.float32) * (SAMPLE_RATE / FFT_SIZE)).astype(np.float32)
+
+# Raw PipeWire FFT bins have a normal music-spectrum tilt: lows dominate and
+# upper harmonics sit far lower. Chromium's AnalyserNode path plus PVFD's local
+# AGC was tuned around browser-shaped bytes, so HLPR applies a fixed visualizer
+# EQ before mapping dB to getByteFrequencyData-style bytes.
+SPECTRUM_PROFILE = "pvfd-chromium-v1"
+_VISUAL_EQ_HZ = np.array(
+    [0, 28, 70, 160, 420, 1500, 3200, 7000, 12000, 20000, 24000],
+    dtype=np.float32,
+)
+_VISUAL_EQ_DB_POINTS = np.array(
+    [-18.0, -14.0, -10.0, -5.0, -1.0, 5.5, 10.0, 14.0, 17.0, 18.0, 18.0],
+    dtype=np.float32,
+)
+_VISUAL_EQ_DB = np.interp(_BIN_FREQS, _VISUAL_EQ_HZ, _VISUAL_EQ_DB_POINTS).astype(np.float32)
 
 logger = logging.getLogger("pvfd-hlpr")
 
@@ -307,6 +323,7 @@ class FrameProducer:
                 spectrum = np.fft.rfft(samples)[:BIN_COUNT]
                 mag = np.abs(spectrum) / _MAG_NORM
                 db = 20.0 * np.log10(np.maximum(mag, 1e-10))
+                db += _VISUAL_EQ_DB
                 norm = np.clip((db - MIN_DB) / DB_RANGE, 0.0, 1.0)
                 bins = (norm * 255.0).astype(np.uint8).tobytes()
                 if not self._consumers:
@@ -338,6 +355,7 @@ HELLO_PAYLOAD = json.dumps({
     "binCount": BIN_COUNT,
     "minDb": MIN_DB,
     "maxDb": MAX_DB,
+    "spectrumProfile": SPECTRUM_PROFILE,
 })
 
 
@@ -368,6 +386,7 @@ def cmd_probe() -> int:
     print(f"  pw-record: {pw_record or '(not found)'}")
     print(f"  parec:     {parec or '(not found)'}")
     print(f"  pactl:     {pactl or '(not found)'}")
+    print(f"\nSpectrum profile: {SPECTRUM_PROFILE}")
     if not (pw_record or parec):
         print("\nFATAL: no capture backend found. Install pipewire-utils (Arch) or pulseaudio-utils.")
         return 2
@@ -396,9 +415,11 @@ def cmd_probe() -> int:
 
 async def main_async(args: argparse.Namespace) -> int:
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
+    logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
 
     target = args.target
     if not target:

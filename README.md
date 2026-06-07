@@ -73,13 +73,14 @@ On connect, helper sends one text frame:
 ```json
 {
   "type": "hello",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "protocol": 1,
   "sampleRate": 48000,
   "fftSize": 2048,
   "binCount": 1024,
   "minDb": -100.0,
-  "maxDb": -30.0
+  "maxDb": -30.0,
+  "spectrumProfile": "pvfd-chromium-v1"
 }
 ```
 
@@ -87,7 +88,9 @@ Each subsequent frame is **1024 raw bytes**, one byte per FFT bin, following
 the Web Audio
 [`getByteFrequencyData`](https://developer.mozilla.org/en-US/docs/Web/API/AnalyserNode/getByteFrequencyData)
 convention: `byte = clamp(((dB - minDb) / (maxDb - minDb)) * 255, 0, 255)`.
-Frame rate is 30 Hz.
+Before that byte mapping, `pvfd-hlpr` applies the `pvfd-chromium-v1`
+visualizer EQ profile so PipeWire's raw FFT spectrum lands closer to the
+Chromium analyser shape PVFD was tuned against. Frame rate is 30 Hz.
 
 Future protocol versions will bump the `protocol` integer. PVFD checks the
 version on connect and surfaces an "update HLPR" notification on mismatch
