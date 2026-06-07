@@ -82,7 +82,7 @@ On connect, helper sends one text frame:
 ```json
 {
   "type": "hello",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "protocol": 1,
   "sampleRate": 48000,
   "fftSize": 2048,

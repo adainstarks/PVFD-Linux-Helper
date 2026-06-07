@@ -89,7 +89,7 @@ except ImportError:  # pragma: no cover
     sys.exit(1)
 
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 PROTOCOL_VERSION = 1
 ALLOWED_ORIGINS = [
     None,
@@ -322,10 +322,14 @@ async def spawn_pw_record(target: Optional[str]) -> asyncio.subprocess.Process:
                 "(Arch) or pulseaudio-utils"
             )
     logger.info("starting capture: %s", " ".join(cmd))
+    popen_kwargs = {}
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
     return await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **popen_kwargs,
     )
 
 
@@ -361,6 +365,16 @@ class FrameProducer:
 
     async def stop(self) -> None:
         self._stopping.set()
+        for q in list(self._consumers):
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                q.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
         if self._proc and self._proc.returncode is None:
             try:
                 self._proc.terminate()
@@ -370,12 +384,18 @@ class FrameProducer:
                 await asyncio.wait_for(self._proc.wait(), timeout=2.0)
             except asyncio.TimeoutError:
                 self._proc.kill()
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    logger.warning("capture process did not exit after kill")
         if self._task:
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        self._proc = None
+        self._task = None
 
     async def _read_chunk(self, n_bytes: int) -> Optional[bytes]:
         assert self._proc and self._proc.stdout
@@ -491,6 +511,8 @@ async def serve_client(producer: FrameProducer, ws: Any) -> None:
         await ws.send(HELLO_PAYLOAD)
         while True:
             frame = await queue.get()
+            if frame is None:
+                break
             await ws.send(frame)
     except websockets.ConnectionClosed:
         pass
@@ -589,17 +611,23 @@ async def main_async(args: argparse.Namespace) -> int:
         "pvfd-hlpr %s — listening on ws://127.0.0.1:%d (protocol v%d)",
         __version__, args.port, PROTOCOL_VERSION,
     )
-    async with websockets.serve(
+    server = await websockets.serve(
         handler,
         "127.0.0.1",
         args.port,
         max_size=None,
         origins=ALLOWED_ORIGINS,
-    ):
+    )
+    try:
         await stop_event.wait()
-
-    logger.info("shutting down")
-    await producer.stop()
+    finally:
+        logger.info("shutting down")
+        server.close()
+        await producer.stop()
+        try:
+            await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+        except asyncio.TimeoutError:
+            logger.warning("WebSocket server did not close within timeout")
     return 0
 
 
