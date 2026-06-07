@@ -89,7 +89,7 @@ except ImportError:  # pragma: no cover
     sys.exit(1)
 
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 PROTOCOL_VERSION = 1
 ALLOWED_ORIGINS = [
     None,
@@ -107,15 +107,24 @@ MAX_DB = -30.0
 DB_RANGE = MAX_DB - MIN_DB
 PAREC_LOW_LATENCY_ARGS = ["--latency-msec=20", "--process-time-msec=10"]
 
-_HANN = np.hanning(FFT_SIZE).astype(np.float32)
+# Web Audio AnalyserNode uses a Blackman window (see W3C Web Audio spec §1.10.1).
+_n = np.arange(FFT_SIZE, dtype=np.float32)
+_BLACKMAN = (
+    0.42
+    - 0.5 * np.cos(2.0 * np.pi * _n / FFT_SIZE)
+    + 0.08 * np.cos(4.0 * np.pi * _n / FFT_SIZE)
+).astype(np.float32)
+del _n
 _MAG_NORM = float(FFT_SIZE)
 _BIN_FREQS = (np.arange(BIN_COUNT, dtype=np.float32) * (SAMPLE_RATE / FFT_SIZE)).astype(np.float32)
 
-# Raw PipeWire FFT bins have a normal music-spectrum tilt: lows dominate and
-# upper harmonics sit far lower. Chromium's AnalyserNode path plus PVFD's local
-# AGC was tuned around browser-shaped bytes, so HLPR applies a fixed visualizer
-# EQ before mapping dB to getByteFrequencyData-style bytes.
-SPECTRUM_PROFILE = "pvfd-chromium-v1"
+# AnalyserNode default smoothingTimeConstant. Applied to magnitude *before* dB.
+SMOOTHING_TIME_CONSTANT = 0.8
+
+# Legacy fixed EQ tilt — kept behind --legacy-eq for A/B against 0.1.8. PVFD's
+# bar visualizer was tuned against a flat AnalyserNode, so the default path now
+# ships flat bytes too.
+SPECTRUM_PROFILE = "pvfd-chromium-v2"
 _VISUAL_EQ_HZ = np.array(
     [0, 28, 70, 160, 420, 1500, 3200, 7000, 12000, 20000, 24000],
     dtype=np.float32,
@@ -336,13 +345,15 @@ async def spawn_pw_record(target: Optional[str]) -> asyncio.subprocess.Process:
 class FrameProducer:
     """Captures audio, computes FFT bins, fans frames out to all WS clients."""
 
-    def __init__(self, target: Optional[str], stats: bool = False):
+    def __init__(self, target: Optional[str], stats: bool = False, legacy_eq: bool = False):
         self.target = target
         self.stats = stats
+        self.legacy_eq = legacy_eq
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._consumers: list[asyncio.Queue[bytes]] = []
         self._task: Optional[asyncio.Task[None]] = None
         self._stopping = asyncio.Event()
+        self._smoothed_mag = np.zeros(BIN_COUNT, dtype=np.float32)
         self._last_stats_at = 0.0
         self._last_frame_at = 0.0
         self._stats_frame_count = 0
@@ -433,11 +444,17 @@ class FrameProducer:
                 samples = samples.reshape(-1, CHANNELS).mean(axis=1) / 32768.0
                 pcm_peak = float(np.max(np.abs(samples))) if samples.size else 0.0
                 pcm_rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
-                samples *= _HANN
+                samples *= _BLACKMAN
                 spectrum = np.fft.rfft(samples)[:BIN_COUNT]
                 mag = np.abs(spectrum) / _MAG_NORM
-                db = 20.0 * np.log10(np.maximum(mag, 1e-10))
-                db += _VISUAL_EQ_DB
+                # Exponential smoothing on magnitude — matches AnalyserNode.
+                self._smoothed_mag = (
+                    SMOOTHING_TIME_CONSTANT * self._smoothed_mag
+                    + (1.0 - SMOOTHING_TIME_CONSTANT) * mag
+                )
+                db = 20.0 * np.log10(np.maximum(self._smoothed_mag, 1e-10))
+                if self.legacy_eq:
+                    db += _VISUAL_EQ_DB
                 norm = np.clip((db - MIN_DB) / DB_RANGE, 0.0, 1.0)
                 frame = (norm * 255.0).astype(np.uint8)
                 if self.stats:
@@ -589,7 +606,7 @@ async def main_async(args: argparse.Namespace) -> int:
         else:
             logger.warning("could not auto-detect a target — pw-record will pick its default")
 
-    producer = FrameProducer(target=target, stats=args.stats)
+    producer = FrameProducer(target=target, stats=args.stats, legacy_eq=args.legacy_eq)
     try:
         await producer.start()
     except RuntimeError as exc:
@@ -644,6 +661,8 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--stats", action="store_true",
                         help="Log one capture-level stats line per second while running.")
+    parser.add_argument("--legacy-eq", action="store_true",
+                        help="Apply the 0.1.8 fixed EQ tilt before dB mapping (A/B against flat bytes).")
     parser.add_argument("--version", action="version", version=f"pvfd-hlpr {__version__} (protocol v{PROTOCOL_VERSION})")
     args = parser.parse_args()
     if args.probe:
