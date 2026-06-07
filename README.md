@@ -51,6 +51,7 @@ routed somewhere, and prints the auto-detected target. No WebSocket binds.
 pvfd-hlpr --port 17455               # bind a different port
 pvfd-hlpr --target <sink>.monitor    # pick a specific PipeWire monitor source
 pvfd-hlpr --verbose                  # debug logging
+pvfd-hlpr --stats                    # one capture stats line per second
 pvfd-hlpr --probe                    # one-shot diagnostic, no WS bind
 pvfd-hlpr --version
 ```

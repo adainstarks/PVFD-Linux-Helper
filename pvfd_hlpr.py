@@ -73,6 +73,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from typing import Any, Optional
 
 try:
@@ -88,7 +89,7 @@ except ImportError:  # pragma: no cover
     sys.exit(1)
 
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 PROTOCOL_VERSION = 1
 ALLOWED_ORIGINS = [
     None,
@@ -244,12 +245,14 @@ async def spawn_pw_record(target: Optional[str]) -> asyncio.subprocess.Process:
 class FrameProducer:
     """Captures audio, computes FFT bins, fans frames out to all WS clients."""
 
-    def __init__(self, target: Optional[str]):
+    def __init__(self, target: Optional[str], stats: bool = False):
         self.target = target
+        self.stats = stats
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._consumers: list[asyncio.Queue[bytes]] = []
         self._task: Optional[asyncio.Task[None]] = None
         self._stopping = asyncio.Event()
+        self._last_stats_at = 0.0
 
     def subscribe(self) -> asyncio.Queue[bytes]:
         q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=4)
@@ -318,13 +321,33 @@ class FrameProducer:
                 del ring[:-bytes_per_frame]
                 samples = np.frombuffer(window_bytes, dtype=np.int16).astype(np.float32)
                 samples = samples.reshape(-1, CHANNELS).mean(axis=1) / 32768.0
+                pcm_peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+                pcm_rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
                 samples *= _HANN
                 spectrum = np.fft.rfft(samples)[:BIN_COUNT]
                 mag = np.abs(spectrum) / _MAG_NORM
                 db = 20.0 * np.log10(np.maximum(mag, 1e-10))
                 db += _VISUAL_EQ_DB
                 norm = np.clip((db - MIN_DB) / DB_RANGE, 0.0, 1.0)
-                bins = (norm * 255.0).astype(np.uint8).tobytes()
+                frame = (norm * 255.0).astype(np.uint8)
+                if self.stats:
+                    now = time.monotonic()
+                    if now - self._last_stats_at >= 1.0:
+                        self._last_stats_at = now
+                        band_means = []
+                        for lo_hz, hi_hz in ((28, 70), (70, 160), (160, 420), (420, 1500), (1500, 3200), (3200, 7000), (7000, 12000)):
+                            lo = max(1, int(lo_hz / (SAMPLE_RATE / FFT_SIZE)))
+                            hi = min(BIN_COUNT - 1, int(np.ceil(hi_hz / (SAMPLE_RATE / FFT_SIZE))))
+                            band_means.append(float(np.mean(frame[lo:hi + 1])) if hi >= lo else 0.0)
+                        logger.info(
+                            "capture stats: consumers=%d pcm_peak=%.4f pcm_rms=%.4f bin_max=%d bands=%s",
+                            len(self._consumers),
+                            pcm_peak,
+                            pcm_rms,
+                            int(frame.max()) if frame.size else 0,
+                            "[" + ", ".join(f"{v:.1f}" for v in band_means) + "]",
+                        )
+                bins = frame.tobytes()
                 if not self._consumers:
                     continue
                 for q in list(self._consumers):
@@ -428,7 +451,7 @@ async def main_async(args: argparse.Namespace) -> int:
         else:
             logger.warning("could not auto-detect a target — pw-record will pick its default")
 
-    producer = FrameProducer(target=target)
+    producer = FrameProducer(target=target, stats=args.stats)
     try:
         await producer.start()
     except RuntimeError as exc:
@@ -475,6 +498,8 @@ def main() -> int:
     parser.add_argument("--probe", action="store_true",
                         help="List PipeWire sinks/monitors and exit without binding the WS.")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--stats", action="store_true",
+                        help="Log one capture-level stats line per second while running.")
     parser.add_argument("--version", action="version", version=f"pvfd-hlpr {__version__} (protocol v{PROTOCOL_VERSION})")
     args = parser.parse_args()
     if args.probe:
