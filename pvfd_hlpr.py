@@ -89,7 +89,7 @@ except ImportError:  # pragma: no cover
     sys.exit(1)
 
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 PROTOCOL_VERSION = 1
 ALLOWED_ORIGINS = [
     None,
@@ -259,7 +259,17 @@ def auto_detect_target() -> Optional[str]:
 # ---------- capture subprocess ----------
 
 async def spawn_pw_record(target: Optional[str]) -> asyncio.subprocess.Process:
-    if shutil.which("pw-record"):
+    use_parec_monitor = bool(target and target.endswith(".monitor") and shutil.which("parec"))
+    if use_parec_monitor:
+        cmd = [
+            "parec",
+            "--rate", str(SAMPLE_RATE),
+            "--channels", str(CHANNELS),
+            "--format", "s16le",
+            "--raw",
+            "-d", target,
+        ]
+    elif shutil.which("pw-record"):
         cmd = [
             "pw-record",
             "--rate", str(SAMPLE_RATE),

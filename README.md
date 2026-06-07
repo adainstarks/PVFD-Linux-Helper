@@ -31,8 +31,8 @@ pipx install git+https://github.com/adainstarks/PVFD-Linux-Helper.git
 pip install --user git+https://github.com/adainstarks/PVFD-Linux-Helper.git
 ```
 
-Requirements: Python 3.10+, `pw-record` (from `pipewire-utils` on Arch) or
-`parec` (from `pulseaudio-utils`), `numpy`, `websockets`.
+Requirements: Python 3.10+, `parec`/`pactl` (from `libpulse` on Arch) or
+`pw-record` (from `pipewire-audio` on Arch), `numpy`, `websockets`.
 
 ## Probe mode
 
@@ -61,7 +61,8 @@ Auto-detection finds the sink Spotify is currently routed to (via
 combinations expose the active stream only as `media.name="audio-src"`; when
 that stream is the lone active sink-input, HLPR treats it as the Spotify
 candidate. Falls back to the default sink's monitor when Spotify isn't
-playing.
+playing. For Pulse/PipeWire monitor names (`*.monitor`), HLPR records through
+`parec -d <monitor>` so the selected monitor source is captured directly.
 
 ## Protocol (v1)
 
