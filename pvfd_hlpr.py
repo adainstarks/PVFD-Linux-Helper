@@ -73,7 +73,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 try:
     import numpy as np
@@ -83,13 +83,12 @@ except ImportError:  # pragma: no cover
 
 try:
     import websockets
-    from websockets.server import WebSocketServerProtocol
 except ImportError:  # pragma: no cover
     sys.stderr.write("pvfd-hlpr requires websockets. Install with: pip install websockets numpy\n")
     sys.exit(1)
 
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 PROTOCOL_VERSION = 1
 ALLOWED_ORIGINS = [
     None,
@@ -359,7 +358,7 @@ HELLO_PAYLOAD = json.dumps({
 })
 
 
-async def serve_client(producer: FrameProducer, ws: WebSocketServerProtocol) -> None:
+async def serve_client(producer: FrameProducer, ws: Any) -> None:
     peer = ws.remote_address
     logger.info("client connected: %s", peer)
     queue = producer.subscribe()
@@ -444,7 +443,7 @@ async def main_async(args: argparse.Namespace) -> int:
         except (NotImplementedError, AttributeError):
             pass
 
-    async def handler(ws: WebSocketServerProtocol, _path: str = "/") -> None:
+    async def handler(ws: Any, _path: str = "/") -> None:
         await serve_client(producer, ws)
 
     logger.info(
