@@ -89,7 +89,7 @@ except ImportError:  # pragma: no cover
     sys.exit(1)
 
 
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 PROTOCOL_VERSION = 1
 ALLOWED_ORIGINS = [
     None,
@@ -118,13 +118,15 @@ del _n
 _MAG_NORM = float(FFT_SIZE)
 _BIN_FREQS = (np.arange(BIN_COUNT, dtype=np.float32) * (SAMPLE_RATE / FFT_SIZE)).astype(np.float32)
 
-# AnalyserNode default smoothingTimeConstant. Applied to magnitude *before* dB.
-SMOOTHING_TIME_CONSTANT = 0.8
+# Matches pioneerVFD.js: AnalyserNode.smoothingTimeConstant = 0.32 (not the Web
+# Audio spec default of 0.8). Applied to magnitude *before* dB. Override with
+# --smoothing.
+SMOOTHING_TIME_CONSTANT = 0.32
 
 # Legacy fixed EQ tilt — kept behind --legacy-eq for A/B against 0.1.8. PVFD's
 # bar visualizer was tuned against a flat AnalyserNode, so the default path now
 # ships flat bytes too.
-SPECTRUM_PROFILE = "pvfd-chromium-v2"
+SPECTRUM_PROFILE = "pvfd-chromium-v2.1"
 _VISUAL_EQ_HZ = np.array(
     [0, 28, 70, 160, 420, 1500, 3200, 7000, 12000, 20000, 24000],
     dtype=np.float32,
@@ -345,10 +347,17 @@ async def spawn_pw_record(target: Optional[str]) -> asyncio.subprocess.Process:
 class FrameProducer:
     """Captures audio, computes FFT bins, fans frames out to all WS clients."""
 
-    def __init__(self, target: Optional[str], stats: bool = False, legacy_eq: bool = False):
+    def __init__(
+        self,
+        target: Optional[str],
+        stats: bool = False,
+        legacy_eq: bool = False,
+        smoothing: float = SMOOTHING_TIME_CONSTANT,
+    ):
         self.target = target
         self.stats = stats
         self.legacy_eq = legacy_eq
+        self.smoothing = max(0.0, min(0.99, float(smoothing)))
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._consumers: list[asyncio.Queue[bytes]] = []
         self._task: Optional[asyncio.Task[None]] = None
@@ -448,10 +457,8 @@ class FrameProducer:
                 spectrum = np.fft.rfft(samples)[:BIN_COUNT]
                 mag = np.abs(spectrum) / _MAG_NORM
                 # Exponential smoothing on magnitude — matches AnalyserNode.
-                self._smoothed_mag = (
-                    SMOOTHING_TIME_CONSTANT * self._smoothed_mag
-                    + (1.0 - SMOOTHING_TIME_CONSTANT) * mag
-                )
+                tau = self.smoothing
+                self._smoothed_mag = tau * self._smoothed_mag + (1.0 - tau) * mag
                 db = 20.0 * np.log10(np.maximum(self._smoothed_mag, 1e-10))
                 if self.legacy_eq:
                     db += _VISUAL_EQ_DB
@@ -606,7 +613,12 @@ async def main_async(args: argparse.Namespace) -> int:
         else:
             logger.warning("could not auto-detect a target — pw-record will pick its default")
 
-    producer = FrameProducer(target=target, stats=args.stats, legacy_eq=args.legacy_eq)
+    producer = FrameProducer(
+        target=target,
+        stats=args.stats,
+        legacy_eq=args.legacy_eq,
+        smoothing=args.smoothing,
+    )
     try:
         await producer.start()
     except RuntimeError as exc:
@@ -663,6 +675,8 @@ def main() -> int:
                         help="Log one capture-level stats line per second while running.")
     parser.add_argument("--legacy-eq", action="store_true",
                         help="Apply the 0.1.8 fixed EQ tilt before dB mapping (A/B against flat bytes).")
+    parser.add_argument("--smoothing", type=float, default=SMOOTHING_TIME_CONSTANT,
+                        help="Magnitude smoothing constant (0.0=raw, 0.32=PVFD AnalyserNode default, 0.8=Web Audio spec default).")
     parser.add_argument("--version", action="version", version=f"pvfd-hlpr {__version__} (protocol v{PROTOCOL_VERSION})")
     args = parser.parse_args()
     if args.probe:
