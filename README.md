@@ -1,4 +1,9 @@
-# pvfd-hlpr
+```
+   ___ _   _________      __ ________   ___  _______ 
+  / _ \ | / / __/ _ \____/ // / __/ /  / _ \/ __/ _ \
+ / ___/ |/ / _// // /___/ _  / _// /__/ ___/ _// , _/
+/_/   |___/_/ /____/   /_//_/___/____/_/  /___/_/|_| 
+```
 
 Linux audio helper for the [PioneerVFD](https://github.com/adainstarks/PioneerVFD)
 Spicetify theme. Taps Spotify's PipeWire output, runs an FFT, and streams the
